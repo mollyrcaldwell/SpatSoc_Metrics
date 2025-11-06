@@ -63,8 +63,6 @@ dt <- group_pts(DT = dt, threshold = 250, id = 'animal_id',
                         timegroup = 'timegroup')
     ## now, the group variable in dt is a unique identifier per group, but note that it doesn't filter out groups with only 1 individual
 
-# convert dt to data frame for summaries
-dt <- as.data.frame(dt)
 ```
 
 # Summary of social groups
@@ -179,7 +177,8 @@ soc_metrics <- left_join(soc_metrics, group_durations)
 spat_metrics <- dt %>% 
     mutate(speed_km_hr = speed_mpsec * 3.6) %>% 
     group_by(species, season) %>% 
-    summarize(avg_speed_km_hr = mean(speed_km_hr, na.rm = TRUE),
+    summarize(no_animals = n_distinct(animal_id),
+              avg_speed_km_hr = mean(speed_km_hr, na.rm = TRUE),
               sd_speed_km_hr = sd(speed_km_hr, na.rm = TRUE),
               avg_KDE_95_km2 = mean(KDE_95_km2, na.rm = TRUE),
               sd_KDE_95_km2 = sd(KDE_95_km2, na.rm = TRUE))
