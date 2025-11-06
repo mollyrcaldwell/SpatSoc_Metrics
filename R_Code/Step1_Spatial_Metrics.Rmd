@@ -1,0 +1,176 @@
+---
+title: "Spatial metrics"
+output: html_document
+date: "2025-11-05"
+author: "Molly Caldwell
+---
+
+# Setup
+
+```{r}
+# set directory to project folder
+setwd("~/OneDrive - University of Wyoming/Documents/UWyo/SpatSoc_Metrics/")
+```
+
+```{r}
+# load in packages
+library(MoveTools) # download from https://github.com/jmerkle1/MerkleLab-Code-Repository/tree/main/MoveTools
+library(sf)
+library(tidyverse)
+library(adehabitatHR)
+```
+
+```{r}
+# load in GPS data, there's a mixture of 1, 2, 3, 4 hour fixes
+data <- readRDS("./Data/elk_deer_loc.rds")
+
+# make spatially aware
+data <- st_as_sf(data, crs = "epsg:4326", coords = c("x", "y"))
+
+# transform to metric coordinate system (NAD83 UTM zone 12 for central WY)
+data <- st_transform(data, crs = "epsg:26912")
+
+# set date format
+data$dateTime <- as.POSIXct(data$dateTime, tz = "MST", format = "%Y-%m-%dT%H:%M:%OS")
+
+# arrange by collar ID and date
+data <- data %>% 
+  arrange(collarId, dateTime)
+```
+
+```{r}
+# define seasons based on month
+# March-May = spring, June-Aug = summer, Sept-Nov = fall, Dec-Feb = winter
+data <- data %>% 
+  mutate(month = month(dateTime),
+         season = case_when(
+                  month %in% c(3:5) ~ "spring",
+                  month %in% c(6:8) ~ "summer",
+                  month %in% c(9:11) ~ "fall",
+                  month %in% c(12, 1, 2) ~ "winter"
+))
+
+# now, add a season-year variable, connecting January & February winter months to prior year
+data <- data %>% 
+  mutate(year = year(dateTime),
+         season_year = case_when(
+                       season != "winter" ~ paste(season, year, sep = "_"),
+                       season == "winter" & month == 12 ~ paste(season, year, sep = "_"),
+                       season == "winter" & month %in% c(1, 2) ~ paste(season, year - 1, sep = "_"),
+         ))
+
+# add id-season-year variable as unique identifier for each individual's season
+data <- data %>% 
+    mutate(id_season_year = paste(collarId, season_year, sep = "_"))
+```
+
+# Movement metrics
+
+```{r}
+# calculate movement "bursts", i.e., connected sequential locations
+data$Burst <- CalcBurst(
+  data = data,
+  id = TRUE,
+  id_name = "collarId",
+  date_name = "dateTime",
+  Tmax = 60*60*4 # 4 hours is max time between points to calculate burst
+)
+
+# calculate movement parameters per animal and sequential locations
+data <- CalcMovParams(
+  data = data,
+  id_name = "collarId",
+  date_name = "dateTime",
+  burst = data$Burst
+)
+
+# rename movement parameters with units
+data <- data %>% 
+  rename(dist_m = dist, # distance between consecutive locations in meters
+         fix_time_sec = dt, # time between consecutive locations in seconds
+          speed_mpsec = speed) # speed is in meters per second
+```
+
+```{r}
+# look at fix rates per individual-season-years
+fix_summ <- data %>% 
+              st_drop_geometry() %>% 
+              group_by(collarId, season_year, fix_time_sec) %>% 
+              summarize(no_pts = n()) %>% 
+              ungroup() %>% 
+              mutate(fix_time_hr = fix_time_sec / 60 / 60) 
+
+
+# add prominent fix rate for each individual-season-year
+fix_prom <- fix_summ %>% 
+                group_by(collarId, season_year) %>% 
+                slice_max(no_pts) %>% 
+                dplyr::select(collarId, season_year, fix_time_hr)
+
+data <- left_join(data, fix_prom)
+
+# check if any id-season-year has > 1 month missing data 
+## < 1344 points for 1 hour fixes
+## < 672 points 2 hour fixes
+## < 448 points for 3 hour fixes
+## < 336 points for 4 hour fixes
+pts_summ <- data %>% 
+              group_by(collarId, season_year, fix_time_hr) %>%
+              summarize(no_pts = n()) %>% 
+              ungroup() %>% 
+              mutate(remove_flag = case_when(
+                              fix_time_hr == 1 & no_pts < 1344 ~ 1,
+                              fix_time_hr == 2 & no_pts < 672 ~ 1,
+                              fix_time_hr == 3 & no_pts < 448 ~ 1,
+                              fix_time_hr == 4 & no_pts < 336 ~ 1,
+                              TRUE ~ 0
+              ))
+
+remove_ids <- pts_summ %>% 
+                filter(remove_flag == 1) %>% 
+                dplyr::select(collarId) # 83 id-year-seasons have > 1 month missing data
+
+## remove id-season-years with > 1 month of missing data from gps data
+data <- data %>% 
+          filter(!(collarId %in% remove_ids$collarId))
+```
+
+
+# Home range metrics
+
+```{r}
+# setup data in spatial points format for KDE
+data_xy <- data %>% 
+              mutate(x = st_coordinates(.)[,1],
+                     y = st_coordinates(.)[,2]) %>% 
+            st_drop_geometry() %>% 
+            as.data.frame()
+
+xy <- subset(data_xy, select = c(x, y))
+id <- subset(data_xy, select = id_season_year)
+data_HR <- id
+coordinates(data_HR) <- xy 
+
+# calculate KDEs per id-season-year
+kde_season <- kernelUD(data_HR[,1], h = "href",
+                      same4all = FALSE,
+                      grid = 250) # 250 m grid
+
+# pull 95% KDEs
+kde_95 <- getverticeshr(kde_season, percent = 95, unin = "m", unout = "km2")
+
+# add 95% KDE area to gps data
+data <- left_join(data, kde_95@data, by = c("id_season_year" = "id"))
+
+data <- data %>% 
+          rename(KDE_95_km2 = area)
+```
+
+```{r}
+# save gps data with spatial metrics
+saveRDS(data, "./Code_Output/elk_deer_spat.rds")
+```
+
+
+
+

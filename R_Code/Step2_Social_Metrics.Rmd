@@ -1,0 +1,196 @@
+---
+title: "Social metrics"
+output: html_document
+date: "2025-11-06"
+author: "Molly Caldwell
+---
+
+# Setup
+
+```{r}
+# set directory to project folder
+setwd("~/OneDrive - University of Wyoming/Documents/UWyo/SpatSoc_Metrics/")
+```
+
+```{r}
+# load in packages
+library(sf)
+library(spatsoc)
+library(data.table)
+library(tidyverse)
+```
+
+```{r}
+# load in GPS data from Step 1 spatial metrics code
+data <- readRDS("./Code_Output/elk_deer_spat.rds")
+
+```
+
+```{r}
+# prep data
+# pull crs
+crs <- st_crs(data)
+
+# create longitude and latitude columns, and remove geometry
+data <- data %>% 
+  mutate(longitude = st_coordinates(geometry)[,1],
+         latitude = st_coordinates(geometry)[,2]) %>% 
+  st_drop_geometry()
+
+# rename collar id and date to make spatsoc package happy
+data <- data %>% 
+  rename(animal_id = collarId, datetime = dateTime)
+```
+
+# Generate social group data
+
+```{r}
+# generate groups of any individuals within 250m within 10 minutes
+# if you want different distances or times, change threhold arguments in the group functions below
+
+# set data as a data table
+dt <- as.data.table(data)
+
+# set date format
+dt[, date := as.POSIXct(datetime)]
+
+# temporal group with threshold of 10 minutes
+dt <- group_times(DT = dt, datetime = 'datetime', threshold = "10 minutes")
+
+# spatial group with threshold of 250 meters
+dt <- group_pts(DT = dt, threshold = 250, id = 'animal_id', 
+                        coords = c('longitude', 'latitude'), 
+                        timegroup = 'timegroup')
+    ## now, the group variable in dt is a unique identifier per group, but note that it doesn't filter out groups with only 1 individual
+
+# convert dt to data frame for summaries
+dt <- as.data.frame(dt)
+```
+
+# Summary of social groups
+
+```{r}
+# generate group size per species and season
+group_size <- dt %>% 
+  group_by(group, species, season) %>% 
+  reframe(group_size = n()) %>% 
+  filter(group_size > 1) 
+
+  # now, summarize average, std deviation, min, and max group size per species
+group_size_summ <- group_size %>% 
+        group_by(species, season) %>% 
+        summarize(avg_group_size = mean(group_size),
+                  sd_group_size = sd(group_size),
+                  min_group_size = min(group_size),
+                  max_group_size = max(group_size))
+
+```
+
+```{r}
+# calculate number of times individuals switch groups per 24-hr
+# first, add a date only column (no time)
+dt <- dt %>% 
+        mutate(date_only = as.Date(datetime, tz = "MST"))
+
+# now, remove groups with only 1 individual
+dt <- left_join(dt, group_size)
+
+dt <- dt %>% 
+        filter(!is.na(group_size))
+
+# next, add variable of the collar IDs in each group
+group_IDs <- dt %>% 
+    group_by(group) %>% 
+    summarize(group_collarIDs = list(animal_id)) %>% 
+    ungroup() %>% 
+    mutate(group_collarIDs = map_chr(group_collarIDs, 
+                                ~ paste(sort(.x), collapse = ",")))
+
+dt <- left_join(dt, group_IDs)
+
+# finally, calculate number of unique groups each individual is in per day
+daily_groups <- dt %>% 
+    group_by(animal_id, date_only, season, species) %>% 
+    summarize(no_daily_groups = n_distinct(group_collarIDs))
+   
+# summarize average and std deviation per species and season     
+daily_groups <- daily_groups %>% 
+    group_by(season, species) %>% 
+    summarize(avg_no_daily_groups = mean(no_daily_groups),
+              sd_no_daily_groups = sd(no_daily_groups))
+```
+
+```{r}
+# calculate length of time animals are in groups before switching
+# first, order by datetime
+setorder(dt, animal_id, datetime)
+
+# add time difference (in hours) between consecutive records per animal
+dt[, time_diff := as.numeric(difftime(datetime, shift(datetime), units = "hours")), by = animal_id]
+
+# Create a logical flag for when to start a new group:
+#  - group_collarIDs changes, OR
+#  - gap > 6 hours, OR
+#  - first observation for that animal (NA time_diff)
+dt[, new_grp := (group_collarIDs != shift(group_collarIDs)) |
+                 (is.na(time_diff)) |
+                 (time_diff > 6),
+   by = animal_id]
+
+# Use cumulative sum of new_grp to create the run ID
+dt[, grp_run := cumsum(new_grp), by = animal_id]
+
+# calculate start, end, and duration (in hours) of each group before switching occurs
+group_durations <- dt[, .(
+  start_time = min(datetime),
+  end_time   = max(datetime),
+  group_duration_hours = as.numeric(difftime(max(datetime), min(datetime), units = "hours")) +
+                   as.numeric(difftime(datetime[2], datetime[1], units = "hours"), na.rm = TRUE) # add one interval
+), by = .(animal_id, group_collarIDs, grp_run)]
+
+# drop unneeded columns
+group_durations$grp_run <- NULL
+
+# replace NA group durations (only together for 1 location) with 0
+group_durations <- group_durations %>% 
+        mutate(group_duration_hours = if_else(is.na(group_duration_hours), 
+                                        0, group_duration_hours))
+
+# average and standard deviation of group duration per species and season
+group_durations <- left_join(group_durations, 
+                    dt %>% select(animal_id, group_collarIDs, datetime, season, species), 
+                    by = c("animal_id", "group_collarIDs", "start_time" = "datetime"))
+
+group_durations <- group_durations %>% 
+                      group_by(species, season) %>% 
+                      summarize(avg_group_duration_hrs = mean(group_duration_hours),
+                                sd_group_duration_hrs = sd(group_duration_hours))
+```
+
+# Combine final spatial & social metrics
+All summarized per species and season
+
+```{r}
+# combine social metrics
+soc_metrics <- left_join(group_size_summ, daily_groups)
+soc_metrics <- left_join(soc_metrics, group_durations)
+
+# summarize spatial metrics per species and season
+spat_metrics <- dt %>% 
+    mutate(speed_km_hr = speed_mpsec * 3.6) %>% 
+    group_by(species, season) %>% 
+    summarize(avg_speed_km_hr = mean(speed_km_hr, na.rm = TRUE),
+              sd_speed_km_hr = sd(speed_km_hr, na.rm = TRUE),
+              avg_KDE_95_km2 = mean(KDE_95_km2, na.rm = TRUE),
+              sd_KDE_95_km2 = sd(KDE_95_km2, na.rm = TRUE))
+
+# combine spatial and social metrics
+spatsoc_metrics <- left_join(spat_metrics, soc_metrics)
+
+# save final metrics
+write_csv(spatsoc_metrics,
+          file = "./Code_Output/elk_deer_spatsoc_metrics.csv")
+```
+
+
+
